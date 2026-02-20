@@ -9,6 +9,11 @@ const PORT = Number(process.env.PORT || 8080);
 const TURN_CAP = 10;
 const ENDPOINT_TIMEOUT_MS = 30_000;
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const RUN_CONTROL_TTL_MS = 20 * 60_000;
+const CODE_QUALITY_MAX = 10;
+const SCORE_PRECISION = 2;
+
+const ACTIVE_RUNS = new Map();
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -28,12 +33,407 @@ app.post("/api/test", async (req, res) => {
     return;
   }
 
-  const input = parsed.value;
-  const scenario = pickScenario(input.scenarioId);
+  try {
+    const result = await executeEvaluationRun({
+      input: parsed.value,
+      runId: crypto.randomUUID()
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      error: error?.message || "Failed to execute evaluation run."
+    });
+  }
+});
+
+app.post("/api/test/stream", async (req, res) => {
+  const parsed = parseAndValidateInput(req.body ?? {});
+  if (!parsed.ok) {
+    res.status(400).json({ status: "error", error: parsed.error });
+    return;
+  }
+
+  const runId = crypto.randomUUID();
+  const runControl = createRunControl(runId);
+  initializeNdjsonStream(res);
+  writeStreamEvent(res, "run_registered", { runId });
+
+  const heartbeat = setInterval(() => {
+    writeStreamEvent(res, "heartbeat", { runId, ts: new Date().toISOString() });
+  }, 15_000);
+
+  res.on("close", () => {
+    if (!runControl.finished && !res.writableEnded) {
+      runControl.stopped = true;
+      releaseRunWaiters(runControl);
+    }
+  });
+
+  try {
+    const result = await executeEvaluationRun({
+      input: parsed.value,
+      runId,
+      runControl,
+      onEvent: (type, data) => writeStreamEvent(res, type, data)
+    });
+    writeStreamEvent(res, "run_completed", result);
+  } catch (error) {
+    writeStreamEvent(res, "run_error", {
+      runId,
+      error: error?.message || "Failed to execute evaluation run."
+    });
+  } finally {
+    clearInterval(heartbeat);
+    runControl.finished = true;
+    releaseRunWaiters(runControl);
+    scheduleRunControlCleanup(runControl);
+    if (!res.writableEnded) {
+      res.end();
+    }
+  }
+});
+
+app.post("/api/runs/:runId/control", (req, res) => {
+  const runId = asTrimmedString(req.params.runId);
+  const action = asTrimmedString(req.body?.action).toLowerCase();
+  const runControl = ACTIVE_RUNS.get(runId);
+
+  if (!runControl) {
+    res.status(404).json({ status: "error", error: "Run not found or already finished." });
+    return;
+  }
+
+  if (!["pause", "resume", "stop"].includes(action)) {
+    res.status(400).json({ status: "error", error: "Action must be pause, resume, or stop." });
+    return;
+  }
+
+  if (runControl.finished) {
+    res.status(409).json({ status: "error", error: "Run is already finished." });
+    return;
+  }
+
+  if (action === "pause") {
+    runControl.paused = true;
+  } else if (action === "resume") {
+    runControl.paused = false;
+    releaseRunWaiters(runControl);
+  } else if (action === "stop") {
+    runControl.stopped = true;
+    runControl.paused = false;
+    releaseRunWaiters(runControl);
+  }
+
+  res.json({
+    status: "ok",
+    runId,
+    action,
+    paused: runControl.paused,
+    stopped: runControl.stopped
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Scammer tester running on http://localhost:${PORT}`);
+});
+
+function parseAndValidateInput(body) {
+  const openaiApiKey = asTrimmedString(body.openaiApiKey);
+  const endpointUrl = asTrimmedString(body.endpointUrl);
+  const endpointApiKey = asTrimmedString(body.endpointApiKey);
+  const scenarioId = asTrimmedString(body.scenarioId) || "all_15";
+  const model = asTrimmedString(body.model) || DEFAULT_MODEL;
+  const explicitRunAll = body.runAllScenarios;
+
+  if (!openaiApiKey) {
+    return { ok: false, error: "OpenAI API key is required." };
+  }
+
+  if (!endpointUrl) {
+    return { ok: false, error: "Endpoint URL is required." };
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(endpointUrl);
+  } catch (_error) {
+    return { ok: false, error: "Endpoint URL is not valid." };
+  }
+
+  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+    return {
+      ok: false,
+      error: "Endpoint URL must use http or https protocol."
+    };
+  }
+
+  let maxTurns = Number(body.maxTurns);
+  if (!Number.isFinite(maxTurns)) {
+    maxTurns = TURN_CAP;
+  }
+  maxTurns = Math.min(TURN_CAP, Math.max(1, Math.floor(maxTurns)));
+
+  let codeQualityScore = Number(body.codeQualityScore);
+  if (!Number.isFinite(codeQualityScore)) {
+    codeQualityScore = 0;
+  }
+  codeQualityScore = Math.min(CODE_QUALITY_MAX, Math.max(0, codeQualityScore));
+
+  const runAllScenarios =
+    typeof explicitRunAll === "boolean"
+      ? explicitRunAll
+      : ["all_15", "all", "auto", ""].includes(scenarioId);
+
+  const metadata = {
+    channel: asTrimmedString(body?.metadata?.channel),
+    language: asTrimmedString(body?.metadata?.language),
+    locale: asTrimmedString(body?.metadata?.locale)
+  };
+
+  return {
+    ok: true,
+    value: {
+      openaiApiKey,
+      endpointUrl: parsedUrl.toString(),
+      endpointApiKey,
+      scenarioId,
+      runAllScenarios,
+      model,
+      maxTurns,
+      codeQualityScore,
+      metadata
+    }
+  };
+}
+
+class RunStoppedError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "RunStoppedError";
+  }
+}
+
+function initializeNdjsonStream(res) {
+  res.setHeader("content-type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("cache-control", "no-cache, no-transform");
+  res.setHeader("connection", "keep-alive");
+  res.flushHeaders?.();
+}
+
+function writeStreamEvent(res, type, data) {
+  if (res.writableEnded || res.destroyed) {
+    return;
+  }
+
+  const payload = {
+    type,
+    ts: new Date().toISOString(),
+    data
+  };
+  res.write(`${JSON.stringify(payload)}\n`);
+}
+
+function createRunControl(runId) {
+  const runControl = {
+    runId,
+    paused: false,
+    stopped: false,
+    finished: false,
+    waiters: new Set(),
+    cleanupTimeout: null
+  };
+  ACTIVE_RUNS.set(runId, runControl);
+  return runControl;
+}
+
+function releaseRunWaiters(runControl) {
+  for (const resolve of runControl.waiters) {
+    resolve();
+  }
+  runControl.waiters.clear();
+}
+
+function scheduleRunControlCleanup(runControl) {
+  if (runControl.cleanupTimeout) {
+    clearTimeout(runControl.cleanupTimeout);
+  }
+  runControl.cleanupTimeout = setTimeout(() => {
+    ACTIVE_RUNS.delete(runControl.runId);
+  }, RUN_CONTROL_TTL_MS);
+}
+
+async function waitForRunAvailability(runControl) {
+  if (!runControl) {
+    return;
+  }
+
+  while (runControl.paused && !runControl.stopped) {
+    await new Promise((resolve) => runControl.waiters.add(resolve));
+  }
+
+  if (runControl.stopped) {
+    throw new RunStoppedError("Run stopped by user.");
+  }
+}
+
+async function executeEvaluationRun({ input, runId, runControl = null, onEvent = () => {} }) {
+  const client = new OpenAI({ apiKey: input.openaiApiKey });
+  const scenarios = selectScenariosForInput(input);
+  const startedAt = Date.now();
+  const scenarioResults = [];
+  let stoppedByUser = false;
+
+  onEvent("run_started", {
+    runId,
+    scenariosTotal: scenarios.length,
+    maxTurns: input.maxTurns,
+    endpoint: {
+      url: input.endpointUrl,
+      timeoutMs: ENDPOINT_TIMEOUT_MS
+    },
+    scenarios: scenarios.map((scenario) => ({
+      id: scenario.id,
+      label: scenario.label,
+      weight: scenario.weight
+    }))
+  });
+
+  for (let index = 0; index < scenarios.length; index += 1) {
+    const scenario = scenarios[index];
+    try {
+      await waitForRunAvailability(runControl);
+    } catch (error) {
+      if (error instanceof RunStoppedError) {
+        stoppedByUser = true;
+        break;
+      }
+      throw error;
+    }
+
+    onEvent("scenario_started", {
+      runId,
+      scenarioIndex: index + 1,
+      scenariosTotal: scenarios.length,
+      scenario: {
+        id: scenario.id,
+        label: scenario.label,
+        objective: scenario.objective,
+        weight: scenario.weight
+      }
+    });
+
+    let scenarioResult;
+    try {
+      scenarioResult = await executeScenarioRun({
+        client,
+        input,
+        scenario,
+        scenarioIndex: index + 1,
+        scenariosTotal: scenarios.length,
+        runControl,
+        onEvent,
+        runId
+      });
+    } catch (error) {
+      if (error instanceof RunStoppedError) {
+        stoppedByUser = true;
+        break;
+      }
+      throw error;
+    }
+
+    scenarioResults.push(scenarioResult);
+
+    onEvent("scenario_completed", {
+      runId,
+      scenarioIndex: index + 1,
+      scenariosTotal: scenarios.length,
+      scenario: {
+        id: scenario.id,
+        label: scenario.label,
+        weight: scenario.weight
+      },
+      status: scenarioResult.status,
+      turnsCompleted: scenarioResult.turnsCompleted,
+      maxTurns: scenarioResult.maxTurns,
+      metrics: scenarioResult.metrics,
+      score: scenarioResult.score,
+      failure: scenarioResult.failure
+    });
+  }
+
+  if (runControl?.stopped) {
+    stoppedByUser = true;
+  }
+
+  const endedAt = Date.now();
+  const aggregateMetrics = buildAggregateMetrics({
+    scenarioResults,
+    durationMs: endedAt - startedAt
+  });
+  const aggregateExtractedIntelligence = mergeExtractedIntelligence(scenarioResults);
+  const score = buildRunScoreSummary({
+    scenarioResults,
+    codeQualityScore: input.codeQualityScore
+  });
+  const finalOutputPreview = buildRunFinalOutputPreview({
+    runId,
+    aggregateMetrics,
+    aggregateExtractedIntelligence
+  });
+
+  const status = stoppedByUser
+    ? "stopped"
+    : scenarioResults.some((scenario) => scenario.status === "partial")
+      ? "partial"
+      : "success";
+
+  if (stoppedByUser) {
+    onEvent("run_stopped", {
+      runId,
+      completedScenarios: scenarioResults.length,
+      totalScenarios: scenarios.length
+    });
+  }
+
+  return {
+    status,
+    runId,
+    maxTurnsPerScenario: input.maxTurns,
+    turnCap: TURN_CAP,
+    scenariosTotal: scenarios.length,
+    scenariosCompleted: scenarioResults.length,
+    expectedTotalTurns: scenarios.length * input.maxTurns,
+    turnsCompleted: scenarioResults.reduce((sum, scenario) => sum + scenario.turnsCompleted, 0),
+    startedAt: new Date(startedAt).toISOString(),
+    endedAt: new Date(endedAt).toISOString(),
+    durationMs: endedAt - startedAt,
+    endpoint: {
+      url: input.endpointUrl,
+      timeoutMs: ENDPOINT_TIMEOUT_MS
+    },
+    metrics: aggregateMetrics,
+    aggregateExtractedIntelligence,
+    score,
+    finalOutputPreview,
+    scenarioResults
+  };
+}
+
+async function executeScenarioRun({
+  client,
+  input,
+  scenario,
+  scenarioIndex,
+  scenariosTotal,
+  runControl,
+  onEvent,
+  runId
+}) {
   const syntheticIntel = createSyntheticIntel(scenario);
   const sessionId = crypto.randomUUID();
   const metadata = buildMetadata(input.metadata, scenario);
-  const client = new OpenAI({ apiKey: input.openaiApiKey });
 
   const startedAt = Date.now();
   const conversationHistory = [];
@@ -42,6 +442,7 @@ app.post("/api/test", async (req, res) => {
   let failure = null;
 
   for (let turn = 1; turn <= input.maxTurns; turn += 1) {
+    await waitForRunAvailability(runControl);
     const latestHoneypotMessage = getLatestHoneypotMessage(transcriptForModel);
 
     const generatedTurn = await generateScammerMessage({
@@ -55,6 +456,7 @@ app.post("/api/test", async (req, res) => {
       latestHoneypotMessage
     });
 
+    await waitForRunAvailability(runControl);
     const scammerMessage = generatedTurn.message;
     const scammerEpoch = Date.now();
     const requestPayload = {
@@ -91,7 +493,7 @@ app.post("/api/test", async (req, res) => {
         reason: endpointResult.error,
         endpointStatus: endpointResult.status
       };
-      turnLogs.push({
+      const failedTurn = {
         turn,
         scammerMessage,
         honeypotMessage: null,
@@ -99,27 +501,49 @@ app.post("/api/test", async (req, res) => {
         endpointLatencyMs: endpointResult.durationMs,
         usedFallback: generatedTurn.usedFallback,
         error: endpointResult.error
+      };
+      turnLogs.push(failedTurn);
+      onEvent("turn_completed", {
+        runId,
+        scenarioId: scenario.id,
+        scenarioLabel: scenario.label,
+        scenarioIndex,
+        scenariosTotal,
+        turnsCompleted: turnLogs.length,
+        maxTurns: input.maxTurns,
+        turn: failedTurn
       });
       break;
     }
 
     const honeypotMessage = readHoneypotReply(endpointResult.body);
     if (!honeypotMessage) {
+      const missingReplyError =
+        "Endpoint response did not include reply, message, or text in JSON body.";
       failure = {
         turn,
-        reason:
-          "Endpoint response did not include reply, message, or text in JSON body.",
+        reason: missingReplyError,
         endpointStatus: endpointResult.status
       };
-      turnLogs.push({
+      const failedTurn = {
         turn,
         scammerMessage,
         honeypotMessage: null,
         endpointStatus: endpointResult.status,
         endpointLatencyMs: endpointResult.durationMs,
         usedFallback: generatedTurn.usedFallback,
-        error:
-          "Endpoint response did not include reply, message, or text in JSON body."
+        error: missingReplyError
+      };
+      turnLogs.push(failedTurn);
+      onEvent("turn_completed", {
+        runId,
+        scenarioId: scenario.id,
+        scenarioLabel: scenario.label,
+        scenarioIndex,
+        scenariosTotal,
+        turnsCompleted: turnLogs.length,
+        maxTurns: input.maxTurns,
+        turn: failedTurn
       });
       break;
     }
@@ -136,14 +560,25 @@ app.post("/api/test", async (req, res) => {
       timestamp: honeypotEpoch
     });
 
-    turnLogs.push({
+    const completedTurn = {
       turn,
       scammerMessage,
       honeypotMessage,
       endpointStatus: endpointResult.status,
       endpointLatencyMs: endpointResult.durationMs,
-      usedFallback: generatedTurn.usedFallback,
-      requestPayload
+      usedFallback: generatedTurn.usedFallback
+    };
+    turnLogs.push(completedTurn);
+
+    onEvent("turn_completed", {
+      runId,
+      scenarioId: scenario.id,
+      scenarioLabel: scenario.label,
+      scenarioIndex,
+      scenariosTotal,
+      turnsCompleted: turnLogs.length,
+      maxTurns: input.maxTurns,
+      turn: completedTurn
     });
   }
 
@@ -155,101 +590,463 @@ app.post("/api/test", async (req, res) => {
     .map((turn) => turn.honeypotMessage)
     .filter(Boolean);
 
+  const plantedIntelligence = extractIntelligence(scammerMessages);
   const extractedIntelligence = extractIntelligence(scammerMessages);
   const metrics = buildConversationMetrics({
     turnLogs,
     honeypotMessages,
     durationMs: endedAt - startedAt
   });
+  const finalOutputPreview = buildFinalOutputPreview({
+    sessionId,
+    extractedIntelligence,
+    metrics,
+    scenario
+  });
+  const score = evaluateScenarioScore({
+    finalOutputPreview,
+    extractedIntelligence,
+    plantedIntelligence,
+    metrics
+  });
 
-  res.json({
+  return {
     status: failure ? "partial" : "success",
     sessionId,
     scenario: {
       id: scenario.id,
       label: scenario.label,
-      objective: scenario.objective
+      objective: scenario.objective,
+      weight: scenario.weight
     },
     maxTurns: input.maxTurns,
-    turnCap: TURN_CAP,
     turnsCompleted: turnLogs.length,
     startedAt: new Date(startedAt).toISOString(),
     endedAt: new Date(endedAt).toISOString(),
     durationMs: endedAt - startedAt,
-    endpoint: {
-      url: input.endpointUrl,
-      timeoutMs: ENDPOINT_TIMEOUT_MS
-    },
     metrics,
+    plantedIntelligence,
     extractedIntelligence,
-    finalOutputPreview: buildFinalOutputPreview({
-      sessionId,
-      extractedIntelligence,
-      metrics,
-      scenario
-    }),
+    finalOutputPreview,
     transcript: turnLogs,
+    score,
     failure
-  });
-});
+  };
+}
 
-app.listen(PORT, () => {
-  console.log(`Scammer tester running on http://localhost:${PORT}`);
-});
-
-function parseAndValidateInput(body) {
-  const openaiApiKey = asTrimmedString(body.openaiApiKey);
-  const endpointUrl = asTrimmedString(body.endpointUrl);
-  const endpointApiKey = asTrimmedString(body.endpointApiKey);
-  const scenarioId = asTrimmedString(body.scenarioId) || "auto";
-  const model = asTrimmedString(body.model) || DEFAULT_MODEL;
-
-  if (!openaiApiKey) {
-    return { ok: false, error: "OpenAI API key is required." };
+function selectScenariosForInput(input) {
+  if (input.runAllScenarios) {
+    return normalizeScenarioWeights(SCENARIOS);
   }
 
-  if (!endpointUrl) {
-    return { ok: false, error: "Endpoint URL is required." };
+  const selected = SCENARIOS.find((scenario) => scenario.id === input.scenarioId);
+  return normalizeScenarioWeights([selected ?? SCENARIOS[0]]);
+}
+
+function normalizeScenarioWeights(scenarios) {
+  if (!scenarios.length) {
+    return [];
   }
 
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(endpointUrl);
-  } catch (_error) {
-    return { ok: false, error: "Endpoint URL is not valid." };
+  const withExistingWeights = scenarios.every(
+    (scenario) => Number.isFinite(scenario.weight) && scenario.weight > 0
+  );
+
+  if (withExistingWeights) {
+    const totalWeight = scenarios.reduce((sum, scenario) => sum + scenario.weight, 0);
+    return scenarios.map((scenario) => ({
+      ...scenario,
+      weight: roundScore((scenario.weight * 100) / totalWeight, 4)
+    }));
   }
 
-  if (!["http:", "https:"].includes(parsedUrl.protocol)) {
+  const equalWeight = 100 / scenarios.length;
+  let accumulated = 0;
+
+  return scenarios.map((scenario, index) => {
+    if (index === scenarios.length - 1) {
+      return {
+        ...scenario,
+        weight: roundScore(100 - accumulated, 4)
+      };
+    }
+
+    const weight = roundScore(equalWeight, 4);
+    accumulated += weight;
     return {
-      ok: false,
-      error: "Endpoint URL must use http or https protocol."
+      ...scenario,
+      weight
+    };
+  });
+}
+
+function buildAggregateMetrics({ scenarioResults, durationMs }) {
+  const totalMessagesExchanged = scenarioResults.reduce(
+    (sum, scenario) => sum + (scenario.metrics?.totalMessagesExchanged || 0),
+    0
+  );
+  const totalQuestions = scenarioResults.reduce(
+    (sum, scenario) => sum + (scenario.metrics?.honeypotQuestionCount || 0),
+    0
+  );
+  const totalRedFlags = scenarioResults.reduce(
+    (sum, scenario) => sum + (scenario.metrics?.redFlagMentions || 0),
+    0
+  );
+  const totalElicitationAttempts = scenarioResults.reduce(
+    (sum, scenario) => sum + (scenario.metrics?.informationElicitationAttempts || 0),
+    0
+  );
+  const relevantProbeTopics = new Set();
+  const latencies = [];
+
+  for (const scenario of scenarioResults) {
+    for (const topic of scenario.metrics?.relevantProbeTopics || []) {
+      relevantProbeTopics.add(topic);
+    }
+    for (const turn of scenario.transcript || []) {
+      if (Number.isFinite(turn.endpointLatencyMs)) {
+        latencies.push(turn.endpointLatencyMs);
+      }
+    }
+  }
+
+  const averageEndpointLatencyMs =
+    latencies.length > 0
+      ? Math.round(latencies.reduce((sum, latency) => sum + latency, 0) / latencies.length)
+      : 0;
+
+  return {
+    turnsReached: scenarioResults.reduce((sum, scenario) => sum + scenario.turnsCompleted, 0),
+    totalMessagesExchanged,
+    engagementDurationSeconds: Math.max(1, Math.round(durationMs / 1000)),
+    honeypotQuestionCount: totalQuestions,
+    relevantProbeCount: relevantProbeTopics.size,
+    relevantProbeTopics: [...relevantProbeTopics].sort(),
+    redFlagMentions: totalRedFlags,
+    informationElicitationAttempts: totalElicitationAttempts,
+    averageEndpointLatencyMs,
+    minEndpointLatencyMs: latencies.length > 0 ? Math.min(...latencies) : 0,
+    maxEndpointLatencyMs: latencies.length > 0 ? Math.max(...latencies) : 0
+  };
+}
+
+function mergeExtractedIntelligence(scenarioResults) {
+  const merged = {
+    phoneNumbers: [],
+    bankAccounts: [],
+    upiIds: [],
+    phishingLinks: [],
+    emailAddresses: [],
+    caseIds: [],
+    policyNumbers: [],
+    orderNumbers: []
+  };
+
+  for (const scenario of scenarioResults) {
+    const intelligence = scenario.extractedIntelligence || {};
+    for (const key of Object.keys(merged)) {
+      const values = Array.isArray(intelligence[key]) ? intelligence[key] : [];
+      for (const value of values) {
+        merged[key].push(value);
+      }
+    }
+  }
+
+  for (const key of Object.keys(merged)) {
+    merged[key] = [...new Set(merged[key])];
+  }
+
+  return merged;
+}
+
+function evaluateScenarioScore({
+  finalOutputPreview,
+  extractedIntelligence,
+  plantedIntelligence,
+  metrics
+}) {
+  const scamDetectionPoints = finalOutputPreview?.scamDetected === true ? 20 : 0;
+  const intelligenceScore = scoreExtractedIntelligence({
+    extractedIntelligence,
+    plantedIntelligence
+  });
+  const conversationQuality = scoreConversationQuality(metrics);
+  const engagementQuality = scoreEngagementQuality(metrics);
+  const responseStructure = scoreResponseStructure(finalOutputPreview);
+
+  const total = roundScore(
+    scamDetectionPoints +
+      intelligenceScore.points +
+      conversationQuality.points +
+      engagementQuality.points +
+      responseStructure.points
+  );
+
+  return {
+    total,
+    breakdown: {
+      scamDetection: {
+        points: roundScore(scamDetectionPoints),
+        maxPoints: 20
+      },
+      extractedIntelligence: intelligenceScore,
+      conversationQuality,
+      engagementQuality,
+      responseStructure
+    }
+  };
+}
+
+function scoreExtractedIntelligence({ extractedIntelligence, plantedIntelligence }) {
+  const candidateKeys = INTELLIGENCE_FIELDS.filter(
+    (key) => Array.isArray(plantedIntelligence?.[key]) && plantedIntelligence[key].length > 0
+  );
+
+  if (!candidateKeys.length) {
+    return {
+      points: 0,
+      maxPoints: 30,
+      matchedFields: 0,
+      totalFields: 0,
+      pointsPerField: 0
     };
   }
 
-  let maxTurns = Number(body.maxTurns);
-  if (!Number.isFinite(maxTurns)) {
-    maxTurns = TURN_CAP;
-  }
-  maxTurns = Math.min(TURN_CAP, Math.max(1, Math.floor(maxTurns)));
+  const pointsPerField = 30 / candidateKeys.length;
+  let matchedFields = 0;
 
-  const metadata = {
-    channel: asTrimmedString(body?.metadata?.channel),
-    language: asTrimmedString(body?.metadata?.language),
-    locale: asTrimmedString(body?.metadata?.locale)
-  };
+  for (const key of candidateKeys) {
+    const expectedValues = plantedIntelligence[key] || [];
+    const actualValues = extractedIntelligence?.[key] || [];
+    if (hasOverlap(expectedValues, actualValues)) {
+      matchedFields += 1;
+    }
+  }
 
   return {
-    ok: true,
-    value: {
-      openaiApiKey,
-      endpointUrl: parsedUrl.toString(),
-      endpointApiKey,
-      scenarioId,
-      model,
-      maxTurns,
-      metadata
+    points: roundScore(matchedFields * pointsPerField),
+    maxPoints: 30,
+    matchedFields,
+    totalFields: candidateKeys.length,
+    pointsPerField: roundScore(pointsPerField)
+  };
+}
+
+function hasOverlap(expectedValues, actualValues) {
+  const expected = new Set(expectedValues.map((value) => normalizeScoreValue(value)));
+  for (const value of actualValues) {
+    if (expected.has(normalizeScoreValue(value))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function normalizeScoreValue(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scoreConversationQuality(metrics) {
+  const turns = metrics?.turnsReached || 0;
+  const questions = metrics?.honeypotQuestionCount || 0;
+  const relevantQuestions = metrics?.relevantProbeCount || 0;
+  const redFlags = metrics?.redFlagMentions || 0;
+  const elicitationAttempts = metrics?.informationElicitationAttempts || 0;
+
+  const turnPoints = turns >= 8 ? 8 : turns >= 6 ? 6 : turns >= 4 ? 3 : 0;
+  const questionPoints = questions >= 5 ? 4 : questions >= 3 ? 2 : questions >= 1 ? 1 : 0;
+  const relevantQuestionPoints =
+    relevantQuestions >= 3 ? 3 : relevantQuestions >= 2 ? 2 : relevantQuestions >= 1 ? 1 : 0;
+  const redFlagPoints = redFlags >= 5 ? 8 : redFlags >= 3 ? 5 : redFlags >= 1 ? 2 : 0;
+  const elicitationPoints = Math.min(7, elicitationAttempts * 1.5);
+
+  return {
+    points: roundScore(
+      turnPoints +
+        questionPoints +
+        relevantQuestionPoints +
+        redFlagPoints +
+        elicitationPoints
+    ),
+    maxPoints: 30,
+    details: {
+      turnCount: { turns, points: turnPoints, maxPoints: 8 },
+      questionsAsked: { questions, points: questionPoints, maxPoints: 4 },
+      relevantQuestions: {
+        relevantQuestions,
+        points: relevantQuestionPoints,
+        maxPoints: 3
+      },
+      redFlagIdentification: { redFlags, points: redFlagPoints, maxPoints: 8 },
+      informationElicitation: {
+        attempts: elicitationAttempts,
+        points: roundScore(elicitationPoints),
+        maxPoints: 7
+      }
     }
   };
+}
+
+function scoreEngagementQuality(metrics) {
+  const duration = metrics?.engagementDurationSeconds || 0;
+  const messages = metrics?.totalMessagesExchanged || 0;
+
+  let points = 0;
+  if (duration > 0) {
+    points += 1;
+  }
+  if (duration > 60) {
+    points += 2;
+  }
+  if (duration > 180) {
+    points += 1;
+  }
+  if (messages > 0) {
+    points += 2;
+  }
+  if (messages >= 5) {
+    points += 3;
+  }
+  if (messages >= 10) {
+    points += 1;
+  }
+
+  return {
+    points: roundScore(points),
+    maxPoints: 10,
+    details: {
+      engagementDurationSeconds: duration,
+      totalMessagesExchanged: messages
+    }
+  };
+}
+
+function scoreResponseStructure(finalOutputPreview) {
+  let points = 0;
+  let missingRequired = 0;
+
+  const hasSessionId = typeof finalOutputPreview?.sessionId === "string" && finalOutputPreview.sessionId;
+  const hasScamDetected = typeof finalOutputPreview?.scamDetected === "boolean";
+  const hasExtractedIntel =
+    finalOutputPreview?.extractedIntelligence &&
+    typeof finalOutputPreview.extractedIntelligence === "object";
+
+  if (hasSessionId) {
+    points += 2;
+  } else {
+    missingRequired += 1;
+  }
+  if (hasScamDetected) {
+    points += 2;
+  } else {
+    missingRequired += 1;
+  }
+  if (hasExtractedIntel) {
+    points += 2;
+  } else {
+    missingRequired += 1;
+  }
+
+  const hasEngagementFields =
+    Number.isFinite(finalOutputPreview?.totalMessagesExchanged) &&
+    Number.isFinite(finalOutputPreview?.engagementDurationSeconds);
+  if (hasEngagementFields) {
+    points += 1;
+  }
+  if (typeof finalOutputPreview?.agentNotes === "string" && finalOutputPreview.agentNotes.trim()) {
+    points += 1;
+  }
+  if (typeof finalOutputPreview?.scamType === "string" && finalOutputPreview.scamType.trim()) {
+    points += 1;
+  }
+  if (Number.isFinite(finalOutputPreview?.confidenceLevel)) {
+    points += 1;
+  }
+
+  points = Math.max(0, points - missingRequired);
+
+  return {
+    points: roundScore(points),
+    maxPoints: 10,
+    missingRequired
+  };
+}
+
+function buildRunScoreSummary({ scenarioResults, codeQualityScore }) {
+  const weightedScenarioScore = roundScore(
+    scenarioResults.reduce((sum, scenario) => {
+      const weight = scenario.scenario?.weight || 0;
+      const total = scenario.score?.total || 0;
+      return sum + (total * weight) / 100;
+    }, 0)
+  );
+  const scenarioContribution = roundScore(weightedScenarioScore * 0.9);
+  const finalProjectedScore = roundScore(
+    Math.min(100, Math.max(0, scenarioContribution + codeQualityScore))
+  );
+
+  const weightedBreakdown = {
+    scamDetection: 0,
+    extractedIntelligence: 0,
+    conversationQuality: 0,
+    engagementQuality: 0,
+    responseStructure: 0
+  };
+
+  for (const scenario of scenarioResults) {
+    const weightMultiplier = (scenario.scenario?.weight || 0) / 100;
+    weightedBreakdown.scamDetection +=
+      (scenario.score?.breakdown?.scamDetection?.points || 0) * weightMultiplier;
+    weightedBreakdown.extractedIntelligence +=
+      (scenario.score?.breakdown?.extractedIntelligence?.points || 0) * weightMultiplier;
+    weightedBreakdown.conversationQuality +=
+      (scenario.score?.breakdown?.conversationQuality?.points || 0) * weightMultiplier;
+    weightedBreakdown.engagementQuality +=
+      (scenario.score?.breakdown?.engagementQuality?.points || 0) * weightMultiplier;
+    weightedBreakdown.responseStructure +=
+      (scenario.score?.breakdown?.responseStructure?.points || 0) * weightMultiplier;
+  }
+
+  for (const key of Object.keys(weightedBreakdown)) {
+    weightedBreakdown[key] = roundScore(weightedBreakdown[key]);
+  }
+
+  return {
+    weightedScenarioScore,
+    scenarioContributionOutOf90: scenarioContribution,
+    codeQualityScoreAssumed: roundScore(codeQualityScore),
+    projectedFinalScore: finalProjectedScore,
+    weightedBreakdown,
+    formula:
+      "Final Score = (Weighted Scenario Score x 0.9) + Code Quality Score (0-10)."
+  };
+}
+
+function buildRunFinalOutputPreview({
+  runId,
+  aggregateMetrics,
+  aggregateExtractedIntelligence
+}) {
+  return {
+    sessionId: runId,
+    scamDetected: true,
+    totalMessagesExchanged: aggregateMetrics.totalMessagesExchanged,
+    engagementDurationSeconds: aggregateMetrics.engagementDurationSeconds,
+    extractedIntelligence: aggregateExtractedIntelligence,
+    scamType: "multi_scenario_suite",
+    confidenceLevel: 0.9,
+    agentNotes:
+      "Aggregated final output generated by the multi-scenario self-evaluation harness."
+  };
+}
+
+function roundScore(value, precision = SCORE_PRECISION) {
+  const factor = 10 ** precision;
+  return Math.round((value + Number.EPSILON) * factor) / factor;
 }
 
 async function generateScammerMessage({
@@ -655,6 +1452,7 @@ function buildConversationMetrics({ turnLogs, honeypotMessages, durationMs }) {
   const relevantTopics = new Set();
   let questionCount = 0;
   let redFlagMentions = 0;
+  let informationElicitationAttempts = 0;
 
   for (const message of honeypotMessages) {
     if (message.includes("?")) {
@@ -671,6 +1469,10 @@ function buildConversationMetrics({ turnLogs, honeypotMessages, durationMs }) {
       if (marker.test(message)) {
         redFlagMentions += 1;
       }
+    }
+
+    if (INFORMATION_ELICITATION_RULES.some((rule) => rule.regex.test(message))) {
+      informationElicitationAttempts += 1;
     }
   }
 
@@ -689,6 +1491,7 @@ function buildConversationMetrics({ turnLogs, honeypotMessages, durationMs }) {
     relevantProbeCount: relevantTopics.size,
     relevantProbeTopics: [...relevantTopics].sort(),
     redFlagMentions,
+    informationElicitationAttempts,
     averageEndpointLatencyMs: avgLatencyMs,
     minEndpointLatencyMs: latencies.length ? Math.min(...latencies) : 0,
     maxEndpointLatencyMs: latencies.length ? Math.max(...latencies) : 0
@@ -808,6 +1611,17 @@ function randomDigits(length) {
   return output.slice(0, length);
 }
 
+const INTELLIGENCE_FIELDS = [
+  "phoneNumbers",
+  "bankAccounts",
+  "upiIds",
+  "phishingLinks",
+  "emailAddresses",
+  "caseIds",
+  "policyNumbers",
+  "orderNumbers"
+];
+
 const QUESTION_TOPIC_RULES = [
   { id: "callback_number", regex: /(callback|call.?back|phone|helpline)/i },
   { id: "employee_id", regex: /(employee id|agent id|id card)/i },
@@ -819,6 +1633,14 @@ const QUESTION_TOPIC_RULES = [
   { id: "full_name", regex: /(full name|your name|who are you)/i },
   { id: "company_name", regex: /(company|organization|merchant)/i },
   { id: "amount", regex: /(amount|how much|fee|charges)/i }
+];
+
+const INFORMATION_ELICITATION_RULES = [
+  { id: "identity", regex: /(name|designation|department|team|who are you)/i },
+  { id: "contact", regex: /(phone|callback|number|helpline|contact)/i },
+  { id: "digital", regex: /(email|website|link|url|official site)/i },
+  { id: "payment", regex: /(upi|account|beneficiary|payee|transaction)/i },
+  { id: "case", regex: /(case|reference|ticket|order|policy)/i }
 ];
 
 const RED_FLAG_MARKERS = [
@@ -1056,6 +1878,202 @@ const SCENARIOS = [
       "Only a few seats remain in this cycle.",
       "Activation window closes in minutes.",
       "Deposit now to lock your return plan."
+    ]
+  },
+  {
+    id: "job_offer",
+    label: "Fake Job Offer Scam",
+    objective:
+      "Offer instant placement and request payment for onboarding, KYC, or training activation.",
+    company: "TalentBridge Careers",
+    department: "HR Verification Unit",
+    emailAlias: "hiring",
+    upiHandle: "jobdesk-pay",
+    domain: "talentbridge-onboard.com",
+    employeePrefix: "HR",
+    casePrefix: "JOB",
+    txnPrefix: "JOIN",
+    shortCode: "job",
+    pathSegment: "verify-profile",
+    amountSamples: ["Rs. 850", "Rs. 1,999", "Rs. 3,500"],
+    defaultDemand:
+      "Pay onboarding fee now and share OTP to confirm your joining slot immediately.",
+    openingLines: [
+      "Congratulations, your CV is shortlisted for immediate joining.",
+      "We have approved your profile for priority placement."
+    ],
+    pressureLines: [
+      "Your slot expires today if payment is not done.",
+      "Offer letter is released only after instant verification.",
+      "Complete this now to avoid profile rejection."
+    ]
+  },
+  {
+    id: "loan_approval",
+    label: "Instant Loan Scam",
+    objective:
+      "Promise fast loan disbursal and force processing or insurance payment first.",
+    company: "RapidCash Finance",
+    department: "Loan Sanction Desk",
+    emailAlias: "loans",
+    upiHandle: "loan-clearance",
+    domain: "rapidcash-approval.com",
+    employeePrefix: "LON",
+    casePrefix: "LOAN",
+    txnPrefix: "DSB",
+    shortCode: "loan",
+    pathSegment: "instant-disbursal",
+    amountSamples: ["Rs. 2,999", "Rs. 4,500", "Rs. 7,250"],
+    defaultDemand:
+      "Pay pre-disbursal charge now and share OTP so your loan can be released instantly.",
+    openingLines: [
+      "Your personal loan is approved and ready for same-day credit.",
+      "Final verification pending before disbursal to your account."
+    ],
+    pressureLines: [
+      "Disbursal will auto-cancel after this verification window.",
+      "Only one quick payment is required from your side.",
+      "Act now to avoid sanction expiry."
+    ]
+  },
+  {
+    id: "tech_support",
+    label: "Remote Access Tech Support Scam",
+    objective:
+      "Claim device compromise and push remote access app plus emergency payment.",
+    company: "Device Secure Support",
+    department: "Technical Risk Team",
+    emailAlias: "support",
+    upiHandle: "techfix-help",
+    domain: "secure-device-fix.com",
+    employeePrefix: "TEC",
+    casePrefix: "CASE",
+    txnPrefix: "FIX",
+    shortCode: "tech",
+    pathSegment: "remote-secure",
+    amountSamples: ["Rs. 1,200", "Rs. 2,400", "Rs. 4,800"],
+    defaultDemand:
+      "Install remote support app now, then pay diagnostic fee and share OTP to secure the device.",
+    openingLines: [
+      "Critical alert: malware activity detected on your device from foreign login.",
+      "Security center warning: your phone is exposed and needs immediate remote cleanup."
+    ],
+    pressureLines: [
+      "If not fixed now, your banking apps may be compromised.",
+      "You must complete verification before the scan can proceed.",
+      "Do not delay, this is a high-risk incident."
+    ]
+  },
+  {
+    id: "social_media",
+    label: "Social Media Verification Scam",
+    objective:
+      "Claim account violation and ask password reset OTP or verification payment.",
+    company: "InstaConnect Support",
+    department: "Account Compliance Team",
+    emailAlias: "compliance",
+    upiHandle: "social-verify",
+    domain: "instaconnect-check.com",
+    employeePrefix: "SOC",
+    casePrefix: "SM",
+    txnPrefix: "ACC",
+    shortCode: "soc",
+    pathSegment: "appeal",
+    amountSamples: ["Rs. 499", "Rs. 999", "Rs. 1,999"],
+    defaultDemand:
+      "Share the login OTP now and pay verification charge to prevent permanent account suspension.",
+    openingLines: [
+      "Notice: policy violation detected and your social account is queued for suspension.",
+      "Your account appeal is pending urgent verification."
+    ],
+    pressureLines: [
+      "Appeal link expires in minutes.",
+      "Without immediate action, your account will be disabled permanently.",
+      "Complete verification now to avoid data loss."
+    ]
+  },
+  {
+    id: "government_subsidy",
+    label: "Government Subsidy Scam",
+    objective:
+      "Pretend subsidy release and collect fee, account details, and OTP.",
+    company: "Citizen Benefits Cell",
+    department: "Subsidy Disbursal Office",
+    emailAlias: "benefits",
+    upiHandle: "govt-release",
+    domain: "benefit-credit-portal.com",
+    employeePrefix: "GOV",
+    casePrefix: "BEN",
+    txnPrefix: "SUB",
+    shortCode: "gov",
+    pathSegment: "release-fund",
+    amountSamples: ["Rs. 750", "Rs. 1,250", "Rs. 2,100"],
+    defaultDemand:
+      "Pay verification charge and share OTP immediately so subsidy can be credited today.",
+    openingLines: [
+      "You are eligible for urgent government subsidy transfer this cycle.",
+      "Your subsidy file is approved and awaiting final activation."
+    ],
+    pressureLines: [
+      "Funds will be reverted if activation is not done now.",
+      "This is a one-time verification requirement.",
+      "Complete the process before the daily settlement closes."
+    ]
+  },
+  {
+    id: "romance_extortion",
+    label: "Romance Extortion Scam",
+    objective:
+      "Build emotional urgency and pressure immediate transfer to resolve fabricated crisis.",
+    company: "Private Assistance Contact",
+    department: "Emergency Desk",
+    emailAlias: "help",
+    upiHandle: "urgent-personal",
+    domain: "priority-help-now.com",
+    employeePrefix: "EMG",
+    casePrefix: "TKT",
+    txnPrefix: "HELP",
+    shortCode: "rom",
+    pathSegment: "urgent",
+    amountSamples: ["Rs. 5,000", "Rs. 12,000", "Rs. 20,000"],
+    defaultDemand:
+      "Send emergency transfer now and share transaction confirmation plus OTP quickly.",
+    openingLines: [
+      "I am in urgent trouble right now and need immediate financial help.",
+      "Emergency situation, I cannot call; please help with quick transfer now."
+    ],
+    pressureLines: [
+      "Please act quickly, there is no time left.",
+      "I will repay once this emergency is resolved.",
+      "Delay will make this situation much worse."
+    ]
+  },
+  {
+    id: "qr_refund",
+    label: "QR Refund Scam",
+    objective:
+      "Pose as merchant support and trick victim into scanning QR or approving collect request.",
+    company: "QuickPay Merchant Help",
+    department: "Refund Settlement Team",
+    emailAlias: "refunds",
+    upiHandle: "refund-center",
+    domain: "quickpay-refund-help.com",
+    employeePrefix: "RFD",
+    casePrefix: "RFD",
+    txnPrefix: "RFN",
+    shortCode: "rfd",
+    pathSegment: "instant-refund",
+    amountSamples: ["Rs. 999", "Rs. 1,850", "Rs. 3,299"],
+    defaultDemand:
+      "Scan the QR now and share OTP to receive refund instantly in your account.",
+    openingLines: [
+      "Your failed payment refund is ready and waiting for acceptance.",
+      "We detected pending refund against your recent transaction."
+    ],
+    pressureLines: [
+      "Refund request expires in a few minutes.",
+      "Approve quickly or the amount will be reversed.",
+      "Complete this now to avoid another refund delay."
     ]
   }
 ];

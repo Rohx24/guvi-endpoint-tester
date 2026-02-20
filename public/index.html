@@ -20,8 +20,8 @@
         <div class="kicker">Honeypot Self Evaluation</div>
         <h1>Scammer Mirror API Tester</h1>
         <p class="subtitle">
-          Run a 10-turn scammer simulation against your endpoint using OpenAI
-          generated scammer replies modeled on your logs.
+          Stream a full evaluation run in real time: 15 scam scenarios with
+          10 turns each, plus PDF-style scoring.
         </p>
 
         <form id="tester-form">
@@ -55,9 +55,9 @@
 
           <div class="two-col">
             <div>
-              <label for="scenarioId">Scenario</label>
+              <label for="scenarioId">Scenario Suite</label>
               <select id="scenarioId" name="scenarioId">
-                <option value="auto">Auto select</option>
+                <option value="all_15" selected>All 15 scenarios</option>
                 <option value="bank_fraud">Bank fraud</option>
                 <option value="lottery_prize">Lottery prize</option>
                 <option value="upi_fraud">UPI fraud</option>
@@ -66,6 +66,13 @@
                 <option value="electricity_bill">Electricity bill</option>
                 <option value="fake_delivery">Fake delivery</option>
                 <option value="investment_scam">Investment scam</option>
+                <option value="job_offer">Fake job offer</option>
+                <option value="loan_approval">Loan approval fraud</option>
+                <option value="tech_support">Tech support scam</option>
+                <option value="social_media">Social media lockout</option>
+                <option value="government_subsidy">Government subsidy</option>
+                <option value="romance_extortion">Romance extortion</option>
+                <option value="qr_refund">QR refund trap</option>
               </select>
             </div>
             <div>
@@ -80,13 +87,21 @@
             </div>
           </div>
 
-          <div class="turn-cap">Turn cap is fixed at <strong>10 turns</strong>.</div>
+          <div class="turn-cap">
+            Turn cap is fixed at <strong>10 turns per scenario</strong>.
+          </div>
 
-          <button id="runButton" type="submit">Run 10-Turn Test</button>
+          <div class="action-row">
+            <button id="runButton" type="submit">Start Live 15x10 Evaluation</button>
+            <button id="pauseButton" class="secondary" type="button" disabled>
+              Pause Endpoint Calls
+            </button>
+          </div>
         </form>
 
         <p class="small-note">
           Keys are used only for the current run. Nothing is persisted to disk.
+          You can pause/resume outgoing endpoint calls during a live run.
         </p>
         <div id="status" class="status" aria-live="polite"></div>
       </section>
@@ -99,10 +114,17 @@
 
         <div id="report" class="report hidden">
           <div class="summary" id="summary"></div>
-          <h3>Transcript</h3>
+
+          <h3>Live Progress</h3>
+          <div id="progressLog" class="progress-log"></div>
+
+          <h3>Scenario Transcript (Real Time)</h3>
           <div id="transcript" class="transcript"></div>
 
-          <h3>Extracted Intelligence</h3>
+          <h3>Scorecard</h3>
+          <div id="scorecard" class="scorecard"></div>
+
+          <h3>Extracted Intelligence (Aggregate)</h3>
           <div id="intel" class="intel"></div>
 
           <h3>Final Output Preview</h3>

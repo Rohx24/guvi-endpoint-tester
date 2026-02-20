@@ -1,6 +1,6 @@
 # Scammer Mirror API Tester
 
-Web app to self-test honeypot APIs with live streaming evaluation runs.
+Web app to self-test honeypot APIs with long-running live evaluation runs.
 
 ## What It Does
 - Collects:
@@ -22,9 +22,10 @@ Web app to self-test honeypot APIs with live streaming evaluation runs.
 - Shows:
   - Live per-scenario transcript
   - Endpoint latency and status per turn
-- Pause/resume controls for outgoing endpoint calls during a run
+  - Pause/resume controls for outgoing endpoint calls during a run
   - PDF-style scoring breakdown (Scam Detection, Intelligence, Conversation, Engagement, Response Structure)
   - Aggregate intelligence extraction and final output preview
+  - GitHub-based code quality score (0-10) used in final projected score
 
 ## Run
 ```bash
@@ -38,7 +39,7 @@ Open `http://localhost:8080`.
 - Endpoint timeout is 30 seconds per turn.
 - No API keys are written to disk.
 - If OpenAI generation fails for a turn, the app uses deterministic fallback scammer phrasing so the run can continue.
-- Code quality score is not inferred automatically; projected final score assumes code quality score `0/10` unless passed explicitly in API input.
+- Code quality score is inferred from the provided GitHub repository URL (if present) and contributes up to `10` points in final projected score.
 - UI flow:
   - Start run: `POST /api/test/async`
   - Poll progress: `GET /api/runs/:runId/events?cursor=<n>`

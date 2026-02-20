@@ -15,8 +15,10 @@ const SCORE_PRECISION = 2;
 const STREAM_HEARTBEAT_MS = 5_000;
 const HEARTBEAT_PAD = "h".repeat(1024);
 const RUN_EVENT_LIMIT = 8_000;
+const GITHUB_QUALITY_CACHE_TTL_MS = 30 * 60_000;
 
 const ACTIVE_RUNS = new Map();
+const GITHUB_QUALITY_CACHE = new Map();
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -223,6 +225,7 @@ function parseAndValidateInput(body) {
   const openaiApiKey = asTrimmedString(body.openaiApiKey);
   const endpointUrl = asTrimmedString(body.endpointUrl);
   const endpointApiKey = asTrimmedString(body.endpointApiKey);
+  const githubRepoUrl = asTrimmedString(body.githubRepoUrl);
   const scenarioId = asTrimmedString(body.scenarioId) || "all_15";
   const model = asTrimmedString(body.model) || DEFAULT_MODEL;
   const explicitRunAll = body.runAllScenarios;
@@ -255,11 +258,16 @@ function parseAndValidateInput(body) {
   }
   maxTurns = Math.min(TURN_CAP, Math.max(1, Math.floor(maxTurns)));
 
-  let codeQualityScore = Number(body.codeQualityScore);
-  if (!Number.isFinite(codeQualityScore)) {
-    codeQualityScore = 0;
+  const normalizedGithubRef = githubRepoUrl
+    ? normalizeGithubRepoRef(githubRepoUrl)
+    : null;
+  if (githubRepoUrl && !normalizedGithubRef) {
+    return {
+      ok: false,
+      error:
+        "GitHub URL must be a valid repository link (for example: https://github.com/owner/repo)."
+    };
   }
-  codeQualityScore = Math.min(CODE_QUALITY_MAX, Math.max(0, codeQualityScore));
 
   const runAllScenarios =
     typeof explicitRunAll === "boolean"
@@ -278,11 +286,11 @@ function parseAndValidateInput(body) {
       openaiApiKey,
       endpointUrl: parsedUrl.toString(),
       endpointApiKey,
+      githubRepoUrl: normalizedGithubRef?.htmlUrl || "",
       scenarioId,
       runAllScenarios,
       model,
       maxTurns,
-      codeQualityScore,
       metadata
     }
   };
@@ -426,12 +434,40 @@ async function executeEvaluationRun({ input, runId, runControl = null, onEvent =
       url: input.endpointUrl,
       timeoutMs: ENDPOINT_TIMEOUT_MS
     },
+    githubRepoUrl: input.githubRepoUrl || null,
     scenarios: scenarios.map((scenario) => ({
       id: scenario.id,
       label: scenario.label,
       weight: scenario.weight
     }))
   });
+
+  const codeQualityPromise = evaluateGithubCodeQuality(input.githubRepoUrl)
+    .then((codeQualityEvaluation) => {
+      onEvent("code_quality_evaluated", {
+        runId,
+        githubRepoUrl: input.githubRepoUrl || null,
+        codeQuality: codeQualityEvaluation
+      });
+      return codeQualityEvaluation;
+    })
+    .catch((error) => {
+      const fallback = {
+        score: 0,
+        maxPoints: CODE_QUALITY_MAX,
+        status: "error",
+        reason:
+          error?.message || "Unable to evaluate GitHub repository for code quality score.",
+        repository: null,
+        checks: []
+      };
+      onEvent("code_quality_evaluated", {
+        runId,
+        githubRepoUrl: input.githubRepoUrl || null,
+        codeQuality: fallback
+      });
+      return fallback;
+    });
 
   for (let index = 0; index < scenarios.length; index += 1) {
     const scenario = scenarios[index];
@@ -507,9 +543,10 @@ async function executeEvaluationRun({ input, runId, runControl = null, onEvent =
     durationMs: endedAt - startedAt
   });
   const aggregateExtractedIntelligence = mergeExtractedIntelligence(scenarioResults);
+  const codeQualityEvaluation = await codeQualityPromise;
   const score = buildRunScoreSummary({
     scenarioResults,
-    codeQualityScore: input.codeQualityScore
+    codeQualityEvaluation
   });
   const finalOutputPreview = buildRunFinalOutputPreview({
     runId,
@@ -549,6 +586,7 @@ async function executeEvaluationRun({ input, runId, runControl = null, onEvent =
     },
     metrics: aggregateMetrics,
     aggregateExtractedIntelligence,
+    codeQualityEvaluation,
     score,
     finalOutputPreview,
     scenarioResults
@@ -1110,7 +1148,334 @@ function scoreResponseStructure(finalOutputPreview) {
   };
 }
 
-function buildRunScoreSummary({ scenarioResults, codeQualityScore }) {
+function normalizeGithubRepoRef(inputUrl) {
+  if (!inputUrl) {
+    return null;
+  }
+
+  const raw = String(inputUrl).trim();
+  if (!raw) {
+    return null;
+  }
+
+  let candidate = raw;
+  const sshMatch = raw.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/i);
+  if (sshMatch) {
+    candidate = `https://github.com/${sshMatch[1]}/${sshMatch[2]}`;
+  } else if (!/^https?:\/\//i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
+  let url;
+  try {
+    url = new URL(candidate);
+  } catch (_error) {
+    return null;
+  }
+
+  const hostname = url.hostname.toLowerCase();
+  if (!["github.com", "www.github.com"].includes(hostname)) {
+    return null;
+  }
+
+  const parts = url.pathname
+    .replace(/^\/+|\/+$/g, "")
+    .split("/")
+    .filter(Boolean);
+  if (parts.length < 2) {
+    return null;
+  }
+
+  const owner = parts[0];
+  const repo = parts[1].replace(/\.git$/i, "");
+  if (!owner || !repo) {
+    return null;
+  }
+
+  return {
+    owner,
+    repo,
+    fullName: `${owner}/${repo}`,
+    htmlUrl: `https://github.com/${owner}/${repo}`
+  };
+}
+
+async function evaluateGithubCodeQuality(githubRepoUrl) {
+  if (!githubRepoUrl) {
+    return {
+      score: 0,
+      maxPoints: CODE_QUALITY_MAX,
+      status: "missing",
+      reason: "GitHub repository URL not provided.",
+      repository: null,
+      checks: []
+    };
+  }
+
+  const ref = normalizeGithubRepoRef(githubRepoUrl);
+  if (!ref) {
+    return {
+      score: 0,
+      maxPoints: CODE_QUALITY_MAX,
+      status: "invalid",
+      reason: "GitHub repository URL is invalid.",
+      repository: null,
+      checks: []
+    };
+  }
+
+  const cacheKey = ref.fullName.toLowerCase();
+  const cached = GITHUB_QUALITY_CACHE.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  const headers = {
+    accept: "application/vnd.github+json",
+    "user-agent": "honeypot-scammer-tester"
+  };
+  if (process.env.GITHUB_TOKEN) {
+    headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+  }
+
+  const repoApiUrl = `https://api.github.com/repos/${ref.fullName}`;
+  const repoResponse = await fetchGithubApiJson(repoApiUrl, headers);
+  if (!repoResponse.ok || !repoResponse.data) {
+    const value = {
+      score: 0,
+      maxPoints: CODE_QUALITY_MAX,
+      status: "unavailable",
+      reason:
+        repoResponse.status === 404
+          ? "Repository was not found or is private."
+          : `GitHub API returned status ${repoResponse.status}.`,
+      repository: {
+        fullName: ref.fullName,
+        htmlUrl: ref.htmlUrl
+      },
+      checks: []
+    };
+    GITHUB_QUALITY_CACHE.set(cacheKey, {
+      value,
+      expiresAt: Date.now() + GITHUB_QUALITY_CACHE_TTL_MS
+    });
+    return value;
+  }
+
+  const repo = repoResponse.data;
+  const checks = [];
+  let points = 0;
+  const baseRepoApi = `https://api.github.com/repos/${repo.full_name}`;
+  const defaultBranch = repo.default_branch || "main";
+
+  const pushCheck = (id, label, earned, maxPoints, details = "") => {
+    const safeEarned = Math.max(0, Math.min(maxPoints, earned));
+    points += safeEarned;
+    checks.push({
+      id,
+      label,
+      points: roundScore(safeEarned),
+      maxPoints,
+      details
+    });
+  };
+
+  pushCheck("repo_access", "Repository Accessibility", 2, 2, "Repository is reachable.");
+
+  const readmeResponse = await fetchGithubApiJson(`${baseRepoApi}/readme`, headers);
+  if (readmeResponse.ok && readmeResponse.data) {
+    const readmeSize = Number(readmeResponse.data.size) || 0;
+    const readmePoints = readmeSize >= 500 ? 2 : 1;
+    pushCheck(
+      "readme",
+      "README Quality Signal",
+      readmePoints,
+      2,
+      `README detected (${readmeSize} bytes).`
+    );
+  } else {
+    pushCheck("readme", "README Quality Signal", 0, 2, "README not found.");
+  }
+
+  const hasLicense =
+    typeof repo.license?.spdx_id === "string" &&
+    repo.license.spdx_id.trim() &&
+    repo.license.spdx_id !== "NOASSERTION";
+  pushCheck(
+    "license",
+    "License Metadata",
+    hasLicense ? 1 : 0,
+    1,
+    hasLicense ? `License: ${repo.license.spdx_id}.` : "License metadata missing."
+  );
+
+  const treeResponse = await fetchGithubApiJson(
+    `${baseRepoApi}/git/trees/${encodeURIComponent(defaultBranch)}?recursive=1`,
+    headers
+  );
+
+  let hasWorkflow = false;
+  let hasTestsByTree = false;
+  let hasTestAutomationFile = false;
+  let hasPackageJson = false;
+
+  if (treeResponse.ok && Array.isArray(treeResponse.data?.tree)) {
+    const testAutomationFiles = new Set([
+      "pytest.ini",
+      "tox.ini",
+      "noxfile.py",
+      "jest.config.js",
+      "jest.config.ts",
+      "vitest.config.ts",
+      "vitest.config.js",
+      "phpunit.xml"
+    ]);
+
+    for (const node of treeResponse.data.tree) {
+      const path = String(node?.path || "");
+      const lowerPath = path.toLowerCase();
+      const baseName = lowerPath.split("/").pop() || "";
+
+      if (
+        lowerPath.startsWith(".github/workflows/") &&
+        (lowerPath.endsWith(".yml") || lowerPath.endsWith(".yaml"))
+      ) {
+        hasWorkflow = true;
+      }
+
+      if (
+        /(^|\/)(test|tests|__tests__)(\/|$)/i.test(lowerPath) ||
+        /\.(spec|test)\.[a-z0-9]+$/i.test(lowerPath) ||
+        /_test\.go$/i.test(lowerPath)
+      ) {
+        hasTestsByTree = true;
+      }
+
+      if (testAutomationFiles.has(baseName)) {
+        hasTestAutomationFile = true;
+      }
+
+      if (lowerPath === "package.json") {
+        hasPackageJson = true;
+      }
+    }
+  }
+
+  let hasRunnablePackageTestScript = false;
+  if (hasPackageJson) {
+    const packageJsonResponse = await fetchGithubApiJson(
+      `${baseRepoApi}/contents/package.json?ref=${encodeURIComponent(defaultBranch)}`,
+      headers
+    );
+    if (packageJsonResponse.ok && packageJsonResponse.data?.content) {
+      const decoded = Buffer.from(
+        String(packageJsonResponse.data.content).replace(/\n/g, ""),
+        "base64"
+      ).toString("utf8");
+      try {
+        const parsedPackage = JSON.parse(decoded);
+        const script = String(parsedPackage?.scripts?.test || "").trim();
+        if (
+          script &&
+          !/no test specified/i.test(script) &&
+          !/^echo\s+["']?error/i.test(script)
+        ) {
+          hasRunnablePackageTestScript = true;
+        }
+      } catch (_error) {
+        hasRunnablePackageTestScript = false;
+      }
+    }
+  }
+
+  const ciPoints = hasWorkflow ? 2 : 0;
+  pushCheck(
+    "ci",
+    "CI Workflow Presence",
+    ciPoints,
+    2,
+    hasWorkflow ? "GitHub Actions workflow detected." : "No CI workflow detected."
+  );
+
+  const testPoints = Math.min(
+    2,
+    (hasTestsByTree ? 1 : 0) +
+      (hasTestAutomationFile || hasRunnablePackageTestScript ? 1 : 0)
+  );
+  pushCheck(
+    "tests",
+    "Testing Signals",
+    testPoints,
+    2,
+    hasTestsByTree
+      ? "Test files/directories detected."
+      : "No explicit test files detected in repository tree."
+  );
+
+  let recencyPoints = 0;
+  let recencyDetails = "Latest push date unavailable.";
+  if (repo.pushed_at) {
+    const pushedAtMs = Date.parse(repo.pushed_at);
+    if (Number.isFinite(pushedAtMs)) {
+      const ageDays = Math.floor((Date.now() - pushedAtMs) / 86_400_000);
+      recencyPoints = ageDays <= 180 ? 1 : 0;
+      recencyDetails = `Last push ${ageDays} day(s) ago.`;
+    }
+  }
+  pushCheck("activity", "Repository Activity Recency", recencyPoints, 1, recencyDetails);
+
+  const value = {
+    score: roundScore(points),
+    maxPoints: CODE_QUALITY_MAX,
+    status: "evaluated",
+    reason: "",
+    repository: {
+      fullName: repo.full_name,
+      htmlUrl: repo.html_url || ref.htmlUrl,
+      defaultBranch,
+      pushedAt: repo.pushed_at || null
+    },
+    checks
+  };
+
+  GITHUB_QUALITY_CACHE.set(cacheKey, {
+    value,
+    expiresAt: Date.now() + GITHUB_QUALITY_CACHE_TTL_MS
+  });
+  return value;
+}
+
+async function fetchGithubApiJson(url, headers) {
+  try {
+    const response = await fetch(url, { headers });
+    const text = await response.text();
+    let data = null;
+    if (text.trim()) {
+      try {
+        data = JSON.parse(text);
+      } catch (_error) {
+        data = null;
+      }
+    }
+    return {
+      ok: response.ok,
+      status: response.status,
+      data
+    };
+  } catch (_error) {
+    return {
+      ok: false,
+      status: 0,
+      data: null
+    };
+  }
+}
+
+function buildRunScoreSummary({ scenarioResults, codeQualityEvaluation }) {
+  const codeQualityScore = Math.min(
+    CODE_QUALITY_MAX,
+    Math.max(0, Number(codeQualityEvaluation?.score) || 0)
+  );
   const weightedScenarioScore = roundScore(
     scenarioResults.reduce((sum, scenario) => {
       const weight = scenario.scenario?.weight || 0;
@@ -1152,7 +1517,8 @@ function buildRunScoreSummary({ scenarioResults, codeQualityScore }) {
   return {
     weightedScenarioScore,
     scenarioContributionOutOf90: scenarioContribution,
-    codeQualityScoreAssumed: roundScore(codeQualityScore),
+    codeQualityScoreGithub: roundScore(codeQualityScore),
+    codeQualityDetails: codeQualityEvaluation || null,
     projectedFinalScore: finalProjectedScore,
     weightedBreakdown,
     formula:

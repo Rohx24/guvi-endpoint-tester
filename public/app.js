@@ -33,6 +33,7 @@ form.addEventListener("submit", async (event) => {
     openaiApiKey: valueOf("openaiApiKey"),
     endpointUrl: valueOf("endpointUrl"),
     endpointApiKey: valueOf("endpointApiKey"),
+    githubRepoUrl: valueOf("githubRepoUrl"),
     scenarioId: valueOf("scenarioId"),
     runAllScenarios: valueOf("scenarioId") === "all_15",
     model: valueOf("model"),
@@ -239,6 +240,17 @@ function handleStreamPacket(packet) {
     return;
   }
 
+  if (type === "code_quality_evaluated") {
+    const quality = data.codeQuality || {};
+    const repoLabel =
+      quality.repository?.fullName || data.githubRepoUrl || "no repository provided";
+    appendProgress(
+      `GitHub code quality evaluated for ${repoLabel}: ${formatScore(quality.score)} / ${quality.maxPoints || 10}.`,
+      quality.status === "evaluated" ? "ok" : "error"
+    );
+    return;
+  }
+
   if (type === "turn_completed") {
     const scenarioId = data.scenarioId;
     const scenarioLabel = data.scenarioLabel;
@@ -330,6 +342,10 @@ function renderFinalReport(result) {
       value: `${formatScore(result.score?.projectedFinalScore)} / 100`
     },
     {
+      label: "Code Quality (GitHub)",
+      value: `${formatScore(result.score?.codeQualityScoreGithub)} / 10`
+    },
+    {
       label: "Questions Asked",
       value: `${result.metrics?.honeypotQuestionCount || 0}`
     },
@@ -393,8 +409,15 @@ function renderScorecard(score) {
       value: `${formatScore(score.scenarioContributionOutOf90)} / 90`
     },
     {
-      label: "Code Quality Assumption",
-      value: `${formatScore(score.codeQualityScoreAssumed)} / 10`
+      label: "Code Quality (GitHub)",
+      value: `${formatScore(score.codeQualityScoreGithub)} / 10`
+    },
+    {
+      label: "GitHub Repository",
+      value:
+        score.codeQualityDetails?.repository?.fullName ||
+        score.codeQualityDetails?.reason ||
+        "Not provided"
     },
     {
       label: "Projected Final Score",

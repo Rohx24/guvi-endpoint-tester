@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Scammer Mirror API Tester</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Sora:wght@400;600;700;800&family=Space+Grotesk:wght@400;500;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="aurora aurora-a"></div>
+    <div class="aurora aurora-b"></div>
+    <main class="shell">
+      <section class="card config-card">
+        <div class="kicker">Honeypot Self Evaluation</div>
+        <h1>Scammer Mirror API Tester</h1>
+        <p class="subtitle">
+          Run a 10-turn scammer simulation against your endpoint using OpenAI
+          generated scammer replies modeled on your logs.
+        </p>
+
+        <form id="tester-form">
+          <label for="openaiApiKey">OpenAI API Key</label>
+          <input
+            id="openaiApiKey"
+            name="openaiApiKey"
+            type="password"
+            autocomplete="off"
+            placeholder="sk-..."
+            required
+          />
+
+          <label for="endpointUrl">Target Endpoint URL</label>
+          <input
+            id="endpointUrl"
+            name="endpointUrl"
+            type="url"
+            placeholder="https://your-api.example.com/honeypot"
+            required
+          />
+
+          <label for="endpointApiKey">Target x-api-key (Optional)</label>
+          <input
+            id="endpointApiKey"
+            name="endpointApiKey"
+            type="text"
+            autocomplete="off"
+            placeholder="abc123xyz"
+          />
+
+          <div class="two-col">
+            <div>
+              <label for="scenarioId">Scenario</label>
+              <select id="scenarioId" name="scenarioId">
+                <option value="auto">Auto select</option>
+                <option value="bank_fraud">Bank fraud</option>
+                <option value="lottery_prize">Lottery prize</option>
+                <option value="upi_fraud">UPI fraud</option>
+                <option value="ecommerce">Ecommerce phishing</option>
+                <option value="kyc_update">KYC update</option>
+                <option value="electricity_bill">Electricity bill</option>
+                <option value="fake_delivery">Fake delivery</option>
+                <option value="investment_scam">Investment scam</option>
+              </select>
+            </div>
+            <div>
+              <label for="model">OpenAI Model</label>
+              <input
+                id="model"
+                name="model"
+                type="text"
+                value="gpt-4.1-mini"
+                required
+              />
+            </div>
+          </div>
+
+          <div class="turn-cap">Turn cap is fixed at <strong>10 turns</strong>.</div>
+
+          <button id="runButton" type="submit">Run 10-Turn Test</button>
+        </form>
+
+        <p class="small-note">
+          Keys are used only for the current run. Nothing is persisted to disk.
+        </p>
+        <div id="status" class="status" aria-live="polite"></div>
+      </section>
+
+      <section class="card report-card">
+        <div id="emptyState" class="empty-state">
+          <h2>No Test Run Yet</h2>
+          <p>Start a run to inspect transcript, latency, and extracted intelligence.</p>
+        </div>
+
+        <div id="report" class="report hidden">
+          <div class="summary" id="summary"></div>
+          <h3>Transcript</h3>
+          <div id="transcript" class="transcript"></div>
+
+          <h3>Extracted Intelligence</h3>
+          <div id="intel" class="intel"></div>
+
+          <h3>Final Output Preview</h3>
+          <pre id="finalOutput" class="json-box"></pre>
+
+          <h3>Full JSON</h3>
+          <pre id="rawJson" class="json-box"></pre>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

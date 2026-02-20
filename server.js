@@ -12,6 +12,8 @@ const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const RUN_CONTROL_TTL_MS = 20 * 60_000;
 const CODE_QUALITY_MAX = 10;
 const SCORE_PRECISION = 2;
+const STREAM_HEARTBEAT_MS = 5_000;
+const HEARTBEAT_PAD = "h".repeat(1024);
 
 const ACTIVE_RUNS = new Map();
 
@@ -57,11 +59,16 @@ app.post("/api/test/stream", async (req, res) => {
   const runId = crypto.randomUUID();
   const runControl = createRunControl(runId);
   initializeNdjsonStream(res);
+  writeStreamEvent(res, "stream_ready", { runId, pad: HEARTBEAT_PAD });
   writeStreamEvent(res, "run_registered", { runId });
 
   const heartbeat = setInterval(() => {
-    writeStreamEvent(res, "heartbeat", { runId, ts: new Date().toISOString() });
-  }, 15_000);
+    writeStreamEvent(res, "heartbeat", {
+      runId,
+      ts: new Date().toISOString(),
+      pad: HEARTBEAT_PAD
+    });
+  }, STREAM_HEARTBEAT_MS);
 
   res.on("close", () => {
     if (!runControl.finished && !res.writableEnded) {
@@ -218,6 +225,9 @@ function initializeNdjsonStream(res) {
   res.setHeader("content-type", "application/x-ndjson; charset=utf-8");
   res.setHeader("cache-control", "no-cache, no-transform");
   res.setHeader("connection", "keep-alive");
+  res.setHeader("x-accel-buffering", "no");
+  res.socket?.setNoDelay(true);
+  res.socket?.setKeepAlive(true, 10_000);
   res.flushHeaders?.();
 }
 
@@ -232,6 +242,7 @@ function writeStreamEvent(res, type, data) {
     data
   };
   res.write(`${JSON.stringify(payload)}\n`);
+  res.flush?.();
 }
 
 function createRunControl(runId) {

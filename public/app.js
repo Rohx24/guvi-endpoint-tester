@@ -126,33 +126,44 @@ async function streamEvaluation(payload) {
   const reader = response.body.getReader();
   let buffer = "";
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    let boundary = buffer.indexOf("\n");
-
-    while (boundary !== -1) {
-      const line = buffer.slice(0, boundary).trim();
-      buffer = buffer.slice(boundary + 1);
-      boundary = buffer.indexOf("\n");
-
-      if (!line) {
-        continue;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) {
+        break;
       }
 
-      let packet;
-      try {
-        packet = JSON.parse(line);
-      } catch (_error) {
-        appendProgress("Skipped malformed stream event.", "error");
-        continue;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n");
+
+      while (boundary !== -1) {
+        const line = buffer.slice(0, boundary).trim();
+        buffer = buffer.slice(boundary + 1);
+        boundary = buffer.indexOf("\n");
+
+        if (!line) {
+          continue;
+        }
+
+        let packet;
+        try {
+          packet = JSON.parse(line);
+        } catch (_error) {
+          appendProgress("Skipped malformed stream event.", "error");
+          continue;
+        }
+        handleStreamPacket(packet);
       }
-      handleStreamPacket(packet);
     }
+  } catch (error) {
+    if (looksLikeNetworkStreamDrop(error)) {
+      throw new Error(
+        "Stream connection dropped by network/proxy. Check Railway logs and endpoint latency."
+      );
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
 
   const trailing = buffer.trim();
@@ -173,6 +184,10 @@ function handleStreamPacket(packet) {
   const data = packet?.data || {};
 
   if (type === "heartbeat") {
+    return;
+  }
+
+  if (type === "stream_ready") {
     return;
   }
 
@@ -225,6 +240,10 @@ function handleStreamPacket(packet) {
       uiState.latencyCount += 1;
     }
 
+    appendProgress(
+      `${scenarioId || "scenario"} turn ${data.turn?.turn || "?"} done (${data.turn?.endpointStatus ?? "ERR"} | ${data.turn?.endpointLatencyMs ?? 0} ms).`,
+      data.turn?.error ? "error" : "ok"
+    );
     renderLiveSummary();
     return;
   }
@@ -590,6 +609,16 @@ function safeJson(response) {
   return response
     .json()
     .catch(() => ({ status: "error", error: "Server returned non-JSON response." }));
+}
+
+function looksLikeNetworkStreamDrop(error) {
+  const message = String(error?.message || "").toLowerCase();
+  return (
+    message.includes("network") ||
+    message.includes("fetch") ||
+    message.includes("terminated") ||
+    message.includes("disconnect")
+  );
 }
 
 function humanizeKey(key) {

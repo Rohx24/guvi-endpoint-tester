@@ -16,19 +16,51 @@ const STREAM_HEARTBEAT_MS = 5_000;
 const HEARTBEAT_PAD = "h".repeat(1024);
 const RUN_EVENT_LIMIT = 8_000;
 const GITHUB_QUALITY_CACHE_TTL_MS = 30 * 60_000;
+const CALLBACK_LOG_LIMIT = parsePositiveInt(process.env.CALLBACK_LOG_LIMIT, 300);
 
 const ACTIVE_RUNS = new Map();
 const GITHUB_QUALITY_CACHE = new Map();
+const CALLBACK_LOGS = [];
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const callbackBodyParser = express.raw({ type: "*/*", limit: "2mb" });
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/api/health", (_req, res) => {
   res.json({ status: "ok", service: "scammer-mirror-tester" });
+});
+
+app.all(["/api/callback", "/callback"], callbackBodyParser, (req, res) => {
+  if (!["GET", "POST"].includes(req.method)) {
+    res.setHeader("allow", "GET, POST");
+    res.status(405).json({ status: "error", error: "Method must be GET or POST." });
+    return;
+  }
+
+  const payload = extractCallbackPayload(req);
+  const entry = recordCallbackLog(req, payload);
+  res.json({
+    status: "ok",
+    message: "Callback received.",
+    callbackId: entry.id,
+    receivedAt: entry.receivedAt
+  });
+});
+
+app.get("/api/callback/logs", (req, res) => {
+  const requestedLimit = parsePositiveInt(req.query.limit, 100);
+  const limit = Math.min(requestedLimit, CALLBACK_LOG_LIMIT);
+  const logs = CALLBACK_LOGS.slice(-limit).reverse();
+  res.json({
+    status: "ok",
+    totalStored: CALLBACK_LOGS.length,
+    limit,
+    logs
+  });
 });
 
 app.post("/api/test", async (req, res) => {
@@ -220,6 +252,85 @@ app.post("/api/runs/:runId/control", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Scammer tester running on http://localhost:${PORT}`);
 });
+
+function extractCallbackPayload(req) {
+  if (req.method === "GET") {
+    return req.query || {};
+  }
+
+  if (req.body == null) {
+    return {};
+  }
+
+  if (Buffer.isBuffer(req.body)) {
+    const raw = req.body.toString("utf8").trim();
+    if (!raw) {
+      return {};
+    }
+
+    const contentType = asTrimmedString(req.headers["content-type"]).toLowerCase();
+
+    if (contentType.includes("application/json")) {
+      try {
+        return JSON.parse(raw);
+      } catch (_error) {
+        return raw;
+      }
+    }
+
+    if (contentType.includes("application/x-www-form-urlencoded")) {
+      return Object.fromEntries(new URLSearchParams(raw).entries());
+    }
+
+    return raw;
+  }
+
+  if (typeof req.body === "object") {
+    return req.body;
+  }
+
+  return String(req.body);
+}
+
+function recordCallbackLog(req, payload) {
+  const entry = {
+    id: crypto.randomUUID(),
+    receivedAt: new Date().toISOString(),
+    method: req.method,
+    path: req.path,
+    query: req.query || {},
+    payload,
+    ip: extractRequestIp(req),
+    userAgent: asTrimmedString(req.headers["user-agent"]),
+    headers: selectCallbackHeaders(req.headers || {})
+  };
+
+  CALLBACK_LOGS.push(entry);
+  if (CALLBACK_LOGS.length > CALLBACK_LOG_LIMIT) {
+    CALLBACK_LOGS.splice(0, CALLBACK_LOGS.length - CALLBACK_LOG_LIMIT);
+  }
+
+  return entry;
+}
+
+function extractRequestIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.socket?.remoteAddress || "";
+}
+
+function selectCallbackHeaders(headers) {
+  const output = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (/authorization|cookie|x-api-key/i.test(key)) {
+      continue;
+    }
+    output[key] = Array.isArray(value) ? value.join(", ") : String(value ?? "");
+  }
+  return output;
+}
 
 function parseAndValidateInput(body) {
   const openaiApiKey = asTrimmedString(body.openaiApiKey);
@@ -2096,6 +2207,14 @@ function normalizeSimple(value) {
 
 function asTrimmedString(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function parsePositiveInt(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return Math.floor(numeric);
 }
 
 function randomItem(items) {

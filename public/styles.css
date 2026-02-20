@@ -224,6 +224,78 @@ button.secondary:hover:not(:disabled) {
   color: var(--ok);
 }
 
+.callback-panel {
+  margin-top: 1rem;
+  padding-top: 0.9rem;
+  border-top: 1px dashed rgba(255, 255, 255, 0.22);
+}
+
+.callback-url {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 11px;
+  background: rgba(4, 17, 25, 0.62);
+  padding: 0.65rem 0.72rem;
+  font-family: var(--mono);
+  font-size: 0.77rem;
+  line-height: 1.45;
+  word-break: break-all;
+  color: var(--accent-c);
+}
+
+.callback-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
+  margin-top: 0.55rem;
+}
+
+.callback-logs {
+  margin-top: 0.5rem;
+  max-height: 320px;
+  overflow: auto;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.callback-log {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 11px;
+  padding: 0.65rem;
+  background: rgba(5, 16, 24, 0.52);
+}
+
+.callback-log-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.35rem 0.8rem;
+  font-size: 0.8rem;
+  font-family: var(--mono);
+  color: var(--accent-c);
+}
+
+.callback-log-meta {
+  margin-top: 0.35rem;
+  font-size: 0.78rem;
+  color: var(--text-1);
+  font-family: var(--mono);
+  line-height: 1.4;
+}
+
+.callback-log-payload {
+  margin: 0.55rem 0 0;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  padding: 0.6rem;
+  background: rgba(4, 13, 20, 0.62);
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  line-height: 1.45;
+}
+
 .empty-state {
   border: 1px dashed rgba(255, 255, 255, 0.28);
   border-radius: 14px;
@@ -452,6 +524,10 @@ button.secondary:hover:not(:disabled) {
 
 @media (max-width: 640px) {
   .two-col {
+    grid-template-columns: 1fr;
+  }
+
+  .callback-actions {
     grid-template-columns: 1fr;
   }
 

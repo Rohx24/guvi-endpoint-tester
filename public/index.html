@@ -112,6 +112,25 @@
           You can pause/resume outgoing endpoint calls during a live run.
         </p>
         <div id="status" class="status" aria-live="polite"></div>
+
+        <section class="callback-panel">
+          <h3>Callback Endpoint</h3>
+          <p class="small-note">
+            Use this URL as your callback URL on Railway or any external API.
+            This app accepts both GET and POST callbacks.
+          </p>
+          <div id="callbackUrl" class="callback-url"></div>
+          <div class="callback-actions">
+            <button id="copyCallbackUrlButton" class="secondary" type="button">
+              Copy Callback URL
+            </button>
+            <button id="refreshCallbackLogsButton" class="secondary" type="button">
+              Refresh Callback Logs
+            </button>
+          </div>
+          <div id="callbackStatus" class="status" aria-live="polite"></div>
+          <div id="callbackLogs" class="callback-logs"></div>
+        </section>
       </section>
 
       <section class="card report-card">

@@ -11,6 +11,12 @@ const scorecardEl = document.getElementById("scorecard");
 const intelEl = document.getElementById("intel");
 const finalOutputEl = document.getElementById("finalOutput");
 const rawJsonEl = document.getElementById("rawJson");
+const callbackUrlEl = document.getElementById("callbackUrl");
+const copyCallbackUrlButton = document.getElementById("copyCallbackUrlButton");
+const refreshCallbackLogsButton = document.getElementById("refreshCallbackLogsButton");
+const callbackStatusEl = document.getElementById("callbackStatus");
+const callbackLogsEl = document.getElementById("callbackLogs");
+const CALLBACK_LOG_POLL_MS = 5000;
 
 const uiState = {
   runId: "",
@@ -25,6 +31,8 @@ const uiState = {
   scenarioNodes: new Map(),
   runCompleted: false
 };
+
+initCallbackViewer();
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -113,6 +121,24 @@ pauseButton.addEventListener("click", async () => {
     }
   }
 });
+
+if (copyCallbackUrlButton) {
+  copyCallbackUrlButton.addEventListener("click", async () => {
+    const callbackUrl = buildCallbackUrl();
+    try {
+      await copyToClipboard(callbackUrl);
+      setCallbackStatus("Callback URL copied.", "ok");
+    } catch (_error) {
+      setCallbackStatus("Unable to copy URL automatically. Please copy it manually.", "error");
+    }
+  });
+}
+
+if (refreshCallbackLogsButton) {
+  refreshCallbackLogsButton.addEventListener("click", () => {
+    void refreshCallbackLogs({ manual: true });
+  });
+}
 
 async function startAsyncRun(payload) {
   const response = await fetch("/api/test/async", {
@@ -592,6 +618,100 @@ function renderIntel(extracted) {
   }
 }
 
+function initCallbackViewer() {
+  if (!callbackUrlEl || !callbackLogsEl) {
+    return;
+  }
+
+  callbackUrlEl.textContent = buildCallbackUrl();
+  setCallbackStatus("Waiting for incoming callback logs...", "ok");
+  void refreshCallbackLogs({ manual: false });
+  setInterval(() => {
+    void refreshCallbackLogs({ manual: false });
+  }, CALLBACK_LOG_POLL_MS);
+}
+
+function buildCallbackUrl() {
+  return `${window.location.origin}/api/callback`;
+}
+
+async function refreshCallbackLogs({ manual }) {
+  try {
+    const response = await fetch("/api/callback/logs?limit=120", { cache: "no-store" });
+    const result = await safeJson(response);
+    if (!response.ok || result.status === "error") {
+      throw new Error(result.error || `Could not load callback logs (${response.status}).`);
+    }
+
+    const logs = Array.isArray(result.logs) ? result.logs : [];
+    renderCallbackLogs(logs);
+    if (manual) {
+      setCallbackStatus(`Loaded ${logs.length} callback logs.`, "ok");
+    }
+  } catch (error) {
+    if (manual) {
+      setCallbackStatus(error.message || "Failed to fetch callback logs.", "error");
+    }
+  }
+}
+
+function renderCallbackLogs(logs) {
+  if (!callbackLogsEl) {
+    return;
+  }
+
+  callbackLogsEl.innerHTML = "";
+  if (!logs.length) {
+    const empty = document.createElement("div");
+    empty.className = "progress-line";
+    empty.textContent = "No callback logs yet. Send GET or POST to the callback URL.";
+    callbackLogsEl.appendChild(empty);
+    return;
+  }
+
+  for (const log of logs) {
+    const block = document.createElement("article");
+    block.className = "callback-log";
+    const payload = formatLogPayload(log.payload);
+    const query = formatLogPayload(log.query);
+    block.innerHTML = `
+      <div class="callback-log-head">
+        <span>${escapeHtml(`${log.method || "?"} ${log.path || "/api/callback"}`)}</span>
+        <span>${escapeHtml(formatTimestamp(log.receivedAt))}</span>
+      </div>
+      <div class="callback-log-meta">IP: ${escapeHtml(log.ip || "-")}</div>
+      <div class="callback-log-meta">Query: ${escapeHtml(query)}</div>
+      <pre class="callback-log-payload">${escapeHtml(payload)}</pre>
+    `;
+    callbackLogsEl.appendChild(block);
+  }
+}
+
+function formatLogPayload(payload) {
+  if (payload == null) {
+    return "{}";
+  }
+  if (typeof payload === "string") {
+    return payload || "{}";
+  }
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch (_error) {
+    return String(payload);
+  }
+}
+
+function formatTimestamp(value) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString();
+}
+
 function resetUiForRun() {
   uiState.runId = "";
   uiState.running = false;
@@ -644,6 +764,34 @@ function setStatus(message, type) {
   if (type) {
     statusBox.classList.add(type);
   }
+}
+
+function setCallbackStatus(message, type) {
+  if (!callbackStatusEl) {
+    return;
+  }
+  callbackStatusEl.textContent = message || "";
+  callbackStatusEl.className = "status";
+  if (type) {
+    callbackStatusEl.classList.add(type);
+  }
+}
+
+async function copyToClipboard(value) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+
+  const helper = document.createElement("textarea");
+  helper.value = value;
+  helper.style.position = "fixed";
+  helper.style.opacity = "0";
+  document.body.appendChild(helper);
+  helper.focus();
+  helper.select();
+  document.execCommand("copy");
+  document.body.removeChild(helper);
 }
 
 function safeJson(response) {

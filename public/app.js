@@ -46,12 +46,19 @@ form.addEventListener("submit", async (event) => {
 
   resetUiForRun();
   setLoading(true);
-  setStatus("Starting live evaluation stream...", "ok");
+  setStatus("Starting background evaluation run...", "ok");
 
   try {
-    await streamEvaluation(payload);
+    const start = await startAsyncRun(payload);
+    uiState.runId = start.runId || "";
+    uiState.running = true;
+    updatePauseButton();
+    await pollRunEvents({
+      runId: start.runId,
+      initialCursor: Number(start.nextCursor) || 0
+    });
     if (!uiState.runCompleted) {
-      throw new Error("Live stream ended before completion.");
+      throw new Error("Run ended before completion.");
     }
   } catch (error) {
     setStatus(error.message || "Run failed.", "error");
@@ -106,8 +113,8 @@ pauseButton.addEventListener("click", async () => {
   }
 });
 
-async function streamEvaluation(payload) {
-  const response = await fetch("/api/test/stream", {
+async function startAsyncRun(payload) {
+  const response = await fetch("/api/test/async", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload)
@@ -118,65 +125,73 @@ async function streamEvaluation(payload) {
     throw new Error(result.error || `Request failed (${response.status})`);
   }
 
-  if (!response.body) {
-    throw new Error("Streaming is not supported by this browser.");
+  const result = await safeJson(response);
+  if (result.status !== "accepted") {
+    throw new Error(result.error || "Run was not accepted.");
   }
+  return result;
+}
 
-  const decoder = new TextDecoder();
-  const reader = response.body.getReader();
-  let buffer = "";
+async function pollRunEvents({ runId, initialCursor = 0 }) {
+  let cursor = initialCursor;
+  let failureCount = 0;
+  const maxFailures = 8;
+  const pollIntervalMs = 1000;
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) {
-        break;
-      }
-
-      buffer += decoder.decode(value, { stream: true });
-      let boundary = buffer.indexOf("\n");
-
-      while (boundary !== -1) {
-        const line = buffer.slice(0, boundary).trim();
-        buffer = buffer.slice(boundary + 1);
-        boundary = buffer.indexOf("\n");
-
-        if (!line) {
-          continue;
-        }
-
-        let packet;
-        try {
-          packet = JSON.parse(line);
-        } catch (_error) {
-          appendProgress("Skipped malformed stream event.", "error");
-          continue;
-        }
-        handleStreamPacket(packet);
-      }
-    }
-  } catch (error) {
-    if (looksLikeNetworkStreamDrop(error)) {
-      throw new Error(
-        "Stream connection dropped by network/proxy. Check Railway logs and endpoint latency."
-      );
-    }
-    throw error;
-  } finally {
-    reader.releaseLock();
-  }
-
-  const trailing = buffer.trim();
-  if (trailing) {
-    let packet;
+  while (true) {
+    let payload;
     try {
-      packet = JSON.parse(trailing);
-    } catch (_error) {
-      appendProgress("Skipped malformed trailing stream event.", "error");
-      return;
+      const response = await fetch(
+        `/api/runs/${encodeURIComponent(runId)}/events?cursor=${cursor}`,
+        { cache: "no-store" }
+      );
+      payload = await safeJson(response);
+      if (!response.ok || payload.status === "error") {
+        throw new Error(payload.error || `Polling failed (${response.status})`);
+      }
+      failureCount = 0;
+    } catch (error) {
+      failureCount += 1;
+      const message = error?.message || "Polling network error.";
+      appendProgress(`Polling issue (${failureCount}/${maxFailures}): ${message}`, "error");
+      if (failureCount >= maxFailures) {
+        throw new Error("Lost connection while polling run progress.");
+      }
+      await sleep(Math.min(3500, pollIntervalMs * failureCount));
+      continue;
     }
-    handleStreamPacket(packet);
+
+    const effectiveCursor = Number(payload.cursor);
+    if (Number.isFinite(effectiveCursor) && effectiveCursor > cursor) {
+      appendProgress("Some early events were trimmed while run continued.", "error");
+    }
+
+    for (const event of payload.events || []) {
+      handleStreamPacket(event);
+    }
+
+    if (Number.isFinite(Number(payload.nextCursor))) {
+      cursor = Number(payload.nextCursor);
+    }
+
+    if (payload.finished) {
+      if (!uiState.runCompleted && payload.result) {
+        uiState.runCompleted = true;
+        uiState.running = false;
+        renderFinalReport(payload.result);
+      }
+      if (!uiState.runCompleted && payload.error) {
+        throw new Error(payload.error);
+      }
+      break;
+    }
+
+    await sleep(pollIntervalMs);
   }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function handleStreamPacket(packet) {
@@ -274,7 +289,10 @@ function handleStreamPacket(packet) {
     const message = data.error || "Run failed.";
     appendProgress(message, "error");
     setStatus(message, "error");
-    throw new Error(message);
+    uiState.running = false;
+    uiState.runCompleted = false;
+    updatePauseButton();
+    return;
   }
 
   if (type === "run_completed") {
@@ -609,16 +627,6 @@ function safeJson(response) {
   return response
     .json()
     .catch(() => ({ status: "error", error: "Server returned non-JSON response." }));
-}
-
-function looksLikeNetworkStreamDrop(error) {
-  const message = String(error?.message || "").toLowerCase();
-  return (
-    message.includes("network") ||
-    message.includes("fetch") ||
-    message.includes("terminated") ||
-    message.includes("disconnect")
-  );
 }
 
 function humanizeKey(key) {

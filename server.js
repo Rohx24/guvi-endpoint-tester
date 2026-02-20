@@ -9,11 +9,12 @@ const PORT = Number(process.env.PORT || 8080);
 const TURN_CAP = 10;
 const ENDPOINT_TIMEOUT_MS = 30_000;
 const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const RUN_CONTROL_TTL_MS = 20 * 60_000;
+const RUN_CONTROL_TTL_MS = 2 * 60 * 60_000;
 const CODE_QUALITY_MAX = 10;
 const SCORE_PRECISION = 2;
 const STREAM_HEARTBEAT_MS = 5_000;
 const HEARTBEAT_PAD = "h".repeat(1024);
+const RUN_EVENT_LIMIT = 8_000;
 
 const ACTIVE_RUNS = new Map();
 
@@ -47,6 +48,79 @@ app.post("/api/test", async (req, res) => {
       error: error?.message || "Failed to execute evaluation run."
     });
   }
+});
+
+app.post("/api/test/async", (req, res) => {
+  const parsed = parseAndValidateInput(req.body ?? {});
+  if (!parsed.ok) {
+    res.status(400).json({ status: "error", error: parsed.error });
+    return;
+  }
+
+  const runId = crypto.randomUUID();
+  const runControl = createRunControl(runId);
+  appendRunEvent(runControl, "run_registered", { runId });
+  startBackgroundRun({
+    input: parsed.value,
+    runId,
+    runControl
+  });
+
+  res.status(202).json({
+    status: "accepted",
+    runId,
+    nextCursor: 0
+  });
+});
+
+app.get("/api/runs/:runId/events", (req, res) => {
+  const runId = asTrimmedString(req.params.runId);
+  const runControl = ACTIVE_RUNS.get(runId);
+
+  if (!runControl) {
+    res.status(404).json({ status: "error", error: "Run not found or expired." });
+    return;
+  }
+
+  const cursorValue = Number(req.query.cursor);
+  const cursor = Number.isFinite(cursorValue) && cursorValue >= 0 ? Math.floor(cursorValue) : 0;
+  const effectiveCursor = Math.max(cursor, runControl.eventOffset);
+  const startIndex = effectiveCursor - runControl.eventOffset;
+  const events = runControl.events.slice(startIndex);
+
+  res.json({
+    status: "ok",
+    runId,
+    cursor: effectiveCursor,
+    nextCursor: runControl.nextEventSeq,
+    eventOffset: runControl.eventOffset,
+    events,
+    finished: runControl.finished,
+    result: runControl.finished ? runControl.result : null,
+    error: runControl.error || null
+  });
+});
+
+app.get("/api/runs/:runId", (req, res) => {
+  const runId = asTrimmedString(req.params.runId);
+  const runControl = ACTIVE_RUNS.get(runId);
+
+  if (!runControl) {
+    res.status(404).json({ status: "error", error: "Run not found or expired." });
+    return;
+  }
+
+  res.json({
+    status: "ok",
+    runId,
+    paused: runControl.paused,
+    stopped: runControl.stopped,
+    finished: runControl.finished,
+    nextCursor: runControl.nextEventSeq,
+    eventOffset: runControl.eventOffset,
+    result: runControl.finished ? runControl.result : null,
+    error: runControl.error || null
+  });
 });
 
 app.post("/api/test/stream", async (req, res) => {
@@ -236,11 +310,7 @@ function writeStreamEvent(res, type, data) {
     return;
   }
 
-  const payload = {
-    type,
-    ts: new Date().toISOString(),
-    data
-  };
+  const payload = createPublicEvent(type, data);
   res.write(`${JSON.stringify(payload)}\n`);
   res.flush?.();
 }
@@ -248,14 +318,67 @@ function writeStreamEvent(res, type, data) {
 function createRunControl(runId) {
   const runControl = {
     runId,
+    createdAt: Date.now(),
     paused: false,
     stopped: false,
     finished: false,
     waiters: new Set(),
-    cleanupTimeout: null
+    cleanupTimeout: null,
+    events: [],
+    eventOffset: 0,
+    nextEventSeq: 0,
+    result: null,
+    error: null,
+    runner: null
   };
   ACTIVE_RUNS.set(runId, runControl);
   return runControl;
+}
+
+function createPublicEvent(type, data) {
+  return {
+    type,
+    ts: new Date().toISOString(),
+    data
+  };
+}
+
+function appendRunEvent(runControl, type, data) {
+  const event = {
+    seq: runControl.nextEventSeq,
+    ...createPublicEvent(type, data)
+  };
+  runControl.events.push(event);
+  runControl.nextEventSeq += 1;
+
+  if (runControl.events.length > RUN_EVENT_LIMIT) {
+    const dropped = runControl.events.length - RUN_EVENT_LIMIT;
+    runControl.events.splice(0, dropped);
+    runControl.eventOffset += dropped;
+  }
+}
+
+function startBackgroundRun({ input, runId, runControl }) {
+  runControl.runner = executeEvaluationRun({
+    input,
+    runId,
+    runControl,
+    onEvent: (type, data) => appendRunEvent(runControl, type, data)
+  })
+    .then((result) => {
+      runControl.result = result;
+      appendRunEvent(runControl, "run_completed", result);
+    })
+    .catch((error) => {
+      const message = error?.message || "Failed to execute evaluation run.";
+      runControl.error = message;
+      appendRunEvent(runControl, "run_error", { runId, error: message });
+    })
+    .finally(() => {
+      runControl.finished = true;
+      releaseRunWaiters(runControl);
+      scheduleRunControlCleanup(runControl);
+    });
 }
 
 function releaseRunWaiters(runControl) {

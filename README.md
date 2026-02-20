@@ -8,6 +8,7 @@ Web app to self-test honeypot APIs with live streaming evaluation runs.
   - Target endpoint URL
   - Optional target `x-api-key`
 - Streams run output in real time (turn-by-turn as each request completes)
+- Uses background execution with cursor-based polling for progress, so long runs survive platform request-duration limits
 - Supports:
   - Full suite: `15 scenarios x 10 turns each`
   - Single scenario debug runs
@@ -21,7 +22,7 @@ Web app to self-test honeypot APIs with live streaming evaluation runs.
 - Shows:
   - Live per-scenario transcript
   - Endpoint latency and status per turn
-  - Pause/resume controls for outgoing endpoint calls during a run
+- Pause/resume controls for outgoing endpoint calls during a run
   - PDF-style scoring breakdown (Scam Detection, Intelligence, Conversation, Engagement, Response Structure)
   - Aggregate intelligence extraction and final output preview
 
@@ -38,3 +39,7 @@ Open `http://localhost:8080`.
 - No API keys are written to disk.
 - If OpenAI generation fails for a turn, the app uses deterministic fallback scammer phrasing so the run can continue.
 - Code quality score is not inferred automatically; projected final score assumes code quality score `0/10` unless passed explicitly in API input.
+- UI flow:
+  - Start run: `POST /api/test/async`
+  - Poll progress: `GET /api/runs/:runId/events?cursor=<n>`
+  - Pause/resume/stop: `POST /api/runs/:runId/control`
